@@ -1,0 +1,356 @@
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+#include <SPI.h>
+#include <RF24.h>
+
+
+// Function prototypes
+void sendGSMAlert(String msg);
+void sendToWeb(float speed, String faultText);
+void measureSpeed();
+void displayStatus();
+void checkObstacle();
+void moveForward();
+void moveBackward();
+void stopMotors();
+void setupRPM();
+
+// LCD - I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// GSM Module on SoftwareSerial
+SoftwareSerial gsm(0, 1); // RX, TX
+
+// Servo
+Servo steeringServo;
+
+// Pins
+const int trigPin = 8;
+const int echoPin = 9;
+const int rpmPin = 3; // RPM sensor now on pin 3
+const int buzzer = 7;
+const int buttonForward = A1; // Button for moving forward
+const int buttonReverse = A0; // Button for reversing
+const int servoPin = 2; // Servo connected to pin 2
+// nrf
+RF24 radio(A2, A3); // CE, CSN
+const byte address[6] = "00001";
+
+struct DataPacket {
+    float speed;
+    char fault[32];
+};
+
+DataPacket receivedData;
+
+
+// Motor Driver
+const int IN1 = 10, IN2 = 11, ENA = 6;
+const int IN3 = 12, IN4 = 13, ENB = 5;
+
+// RPM Globals
+volatile int pulseCount = 0;
+unsigned long lastTime = 0;
+int rpm = 0;
+float speed = 0;
+bool emergencyStop = false;
+
+void setup() {
+    Serial.begin(9600);  // Initialize serial for debugging
+    pinMode(trigPin, OUTPUT);
+    pinMode(echoPin, INPUT);
+    pinMode(rpmPin, INPUT_PULLUP);
+    pinMode(buzzer, OUTPUT);
+    pinMode(buttonForward, INPUT_PULLUP);
+    pinMode(buttonReverse, INPUT_PULLUP);
+
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(ENA, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+    pinMode(ENB, OUTPUT);
+
+    lcd.begin(16, 2);
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("V2V SYSTEM");
+
+    gsm.begin(9600);
+
+    steeringServo.attach(servoPin);
+    steeringServo.write(90); // Neutral center
+    
+    diagnosticCheck(); // Run preliminary device checks
+    setupRPM();
+    setupNRFReceiver();
+
+}
+
+void loop() {
+    measureSpeed();
+    displayStatus();
+    checkObstacle();
+    receiveWirelessData();
+
+        if (digitalRead(buttonForward) == HIGH && digitalRead(buttonReverse) == LOW) {
+            moveForward();
+        } else if (digitalRead(buttonReverse) == HIGH && digitalRead(buttonForward) == LOW) {
+            moveBackward();
+        }
+        else if (digitalRead(buttonReverse) == LOW && digitalRead(buttonForward) == LOW) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 180);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+
+        }
+       
+        else {
+            stopMotors();
+        }
+  
+    
+}
+
+void diagnosticCheck() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Running Checks...");
+    delay(1000);
+    
+    // Check LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("LCD: OK");
+    delay(1000);
+    
+    // Check GSM Module
+    gsm.println("AT");
+    delay(500);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (gsm.available()) {
+        lcd.print("GSM: OK");
+    } else {
+        lcd.print("GSM: FAIL");
+    }
+    delay(1000);
+    
+    // Check RPM Sensor
+    pulseCount = 0;
+    delay(1000);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (pulseCount > 0) {
+        lcd.print("RPM: OK");
+    } else {
+        lcd.print("RPM: FAIL");
+    }
+    delay(1000);
+
+    // Check Ultrasonic Sensor
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    long duration = pulseIn(echoPin, HIGH);
+    float distance = duration * 0.034 / 2;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (distance > 0) {
+        lcd.print("ULTRASONIC: OK");
+    } else {
+        lcd.print("ULTRASONIC: FAIL");
+    }
+    delay(1000);
+
+    // Check Servo Motor
+    steeringServo.write(45);
+    delay(500);
+    steeringServo.write(90);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SERVO: OK");
+    delay(1000);
+
+    // Check Motor Driver
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    delay(500);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    delay(500);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MOTORS: OK");
+    delay(1000);
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Checks Complete!");
+    delay(2000);
+}
+// RPM Sensor Setup
+void setupRPM() {
+    pinMode(rpmPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(rpmPin), countPulse, FALLING);
+}
+
+// Interrupt Function for RPM Counting
+void countPulse() {
+    pulseCount++;
+    Serial.println("Pulse detected! Count: " + String(pulseCount));
+}
+
+// Speed Calculation Logic
+void measureSpeed() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastTime >= 1000) {
+        noInterrupts();
+        int count = pulseCount;
+        pulseCount = 0;
+        interrupts();
+
+        rpm = count * 60;
+        speed = rpm * 0.1;
+
+        Serial.print("RPM: ");
+        Serial.println(rpm);
+
+        Serial.print("Speed: ");
+        Serial.println(speed);
+
+        lastTime = currentTime;
+    }
+}
+
+void displayStatus() {
+    lcd.setCursor(0, 0);
+    lcd.print("Speed: ");
+    lcd.print((int)speed);
+    lcd.print(" km/h   ");
+
+    lcd.setCursor(0, 1);
+    emergencyStop ? lcd.print("Obstacle Ahead!") : lcd.print("Status: OK     ");
+}
+
+void checkObstacle() {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    long duration = pulseIn(echoPin, HIGH);
+    float distance = duration * 0.034 / 2;
+
+    if (distance < 20.0) {
+        digitalWrite(buzzer, LOW);
+        emergencyStop = true;
+        sendGSMAlert("Obstacle detected! Speed: " + String((int)speed));
+        sendToWeb(speed, "Obstacle detected");
+
+     
+    } 
+    else {
+        digitalWrite(buzzer, HIGH);
+        emergencyStop = false;
+    }
+}
+
+void moveForward() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, 180);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, 180);
+}
+
+void moveBackward() {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 180);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENB, 180);
+}
+
+void stopMotors() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 0);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, 0);
+}
+
+void sendGSMAlert(String msg) {
+    gsm.println("AT+CMGF=1");
+    delay(100);
+    gsm.println("AT+CMGS=\"+256761232313\"");
+    delay(100);
+    gsm.print(msg);
+    delay(100);
+    gsm.write(26);
+    delay(2000);
+}
+
+void sendToWeb(float speed, String faultText) {
+    String url = "https://v2v-dashboard-tractech-inovs-projects.vercel.app/update?id=A&speed=" 
+                + String((int)speed) + "&fault=" + faultText;
+
+    Serial.print("Sending Request: ");
+    Serial.println(url);
+
+    gsm.println("AT+HTTPINIT");
+    delay(100);
+    gsm.println("AT+HTTPPARA=\"CID\",1");
+    delay(100);
+    gsm.println("AT+HTTPPARA=\"URL\",\"" + url + "\"");
+    delay(100);
+    gsm.println("AT+HTTPACTION=0");
+    delay(2000);
+    
+    gsm.println("AT+HTTPREAD"); // Read HTTP response for debugging
+    delay(100);
+}
+
+void setupNRFReceiver() {
+    radio.begin();
+    radio.setPALevel(RF24_PA_LOW);
+    radio.openReadingPipe(1, address);
+    radio.startListening();
+    Serial.println(" NRF24L01 Receiver Initialized");
+}
+
+void receiveWirelessData() {
+    if (radio.available()) {
+        Serial.println(" Receiving data from NRF...");
+        radio.read(&receivedData, sizeof(receivedData));
+
+        Serial.print(" Received Speed: ");
+        Serial.print(receivedData.speed);
+        Serial.print(" Fault: ");
+        Serial.println(receivedData.fault);
+
+        Serial.println( "Checking motor control...");
+        Serial.print("IN1: "); Serial.println(digitalRead(IN1));
+        Serial.print("IN2: "); Serial.println(digitalRead(IN2));
+
+        // Trigger Alarm on Fault
+        if (String(receivedData.fault) != "none") {
+            Serial.println(" Fault detected! Activating alarm.");
+            digitalWrite(buzzer, LOW);
+        } else {
+            Serial.println("No fault detected. Alarm off.");
+            digitalWrite(buzzer, HIGH);
+        }
+    }
+}
